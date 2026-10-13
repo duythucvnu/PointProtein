@@ -1,4 +1,6 @@
+num_points: 1024
 # Dataset Related
+
 dataset:
   common:
     NAME: ProteinEC
