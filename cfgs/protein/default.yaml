@@ -1,0 +1,68 @@
+# Dataset Related
+dataset:
+  common:
+    NAME: ProteinEC
+    use_features: False
+    data_dir: '/kaggle/input/datasets/duythucai/protein/kaggle/working/data/random'
+  train:
+    split: train
+  val:
+    split: val
+  test:
+    split: test
+
+feature_keys: pos
+
+datatransforms:
+  train: [PointsToTensor]  # rotation does not help
+  vote: []
+  val: [PointsToTensor]
+  kwargs:
+    shift: [0.2, 0.2, 0.2]
+batch_size: 32
+dataloader:
+  num_workers: 6
+  collate_fn: concat_collate_fn
+
+num_classes: 7
+# ---------------------------------------------------------------------------- #
+# Training cfgs
+# ---------------------------------------------------------------------------- #
+# training receipe borrowed from: https://github.com/yanx27/Pointnet_Pointnet2_pytorch
+
+# ---------------------------------------------------------------------------- #
+# Training cfgs
+# ---------------------------------------------------------------------------- #
+# this one is better. 
+sched: cosine
+epochs: 200
+warmup_epochs: 20
+min_lr: null 
+
+# Training parameters
+lr: 0.001
+optimizer:
+ NAME: 'adamw'
+ weight_decay: 0.05 
+
+grad_norm_clip: 1
+
+criterion_args:
+  NAME: SmoothCrossEntropy
+  label_smoothing: 0.2
+
+# ---------------------------------------------------------------------------- #
+# io and misc
+# ---------------------------------------------------------------------------- #
+log_dir: 'proteinshake'
+print_freq: 10
+val_freq: 1
+
+# ----------------- Model related
+val_batch_size: 64
+pretrained_path: null 
+
+wandb:
+  project: PointNeXt-Protein
+
+seed: null

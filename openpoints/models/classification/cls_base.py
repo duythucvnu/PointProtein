@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import logging
 from typing import List
+from torch_geometric.nn import global_mean_pool, global_max_pool
 from ..layers import create_linearblock
 from ...utils import get_missing_parameters_message, get_unexpected_parameters_message
 from ..build import MODELS, build_model_from_cfg
@@ -133,4 +134,80 @@ class ClsHead(nn.Module):
                     global_feats.append(torch.mean(end_points, dim=self.point_dim, keepdim=False))
             end_points = torch.cat(global_feats, dim=1)
         logits = self.head(end_points)
+        return logits
+
+@MODELS.register_module()
+class ClsHeadPyG(nn.Module):
+    """
+    Classification Head tương thích 100% với PyG Sparse Batching.
+    Tôn trọng toàn bộ tham số YAML của ClsHead gốc.
+    """
+    def __init__(self,
+                 num_classes: int,
+                 in_channels: int,
+                 mlps: List[int] = [256],
+                 norm_args: dict = {'norm': 'bn1d'},
+                 act_args: dict = {'act': 'relu'},
+                 dropout: float = 0.5,
+                 global_feat: str = 'max,avg',   # Mặc định kết hợp cả Max Pool và Mean Pool
+                 **kwargs
+                 ):
+        super().__init__()
+        if kwargs:
+            logging.warning(f"kwargs: {kwargs} are not used in {__class__.__name__}")
+
+        self.global_feat = global_feat.split(',') if global_feat is not None else ['max']
+        
+        # Nếu dùng cả 'max' và 'avg', số kênh đầu vào của MLP sẽ nhân đôi (len(global_feat) * in_channels)
+        in_dim = len(self.global_feat) * in_channels if global_feat is not None else in_channels
+        
+        if mlps is not None:
+            mlps = [in_dim] + mlps + [num_classes]
+        else:
+            mlps = [in_dim, num_classes]
+
+        # Xây dựng chuỗi MLP phân loại (Linear + Norm + Act + Dropout)
+        heads = []
+        for i in range(len(mlps) - 2):
+            heads.append(create_linearblock(mlps[i], mlps[i + 1],
+                                            norm_args=norm_args,
+                                            act_args=act_args))
+            if dropout > 0:
+                heads.append(nn.Dropout(dropout))
+        
+        # Tầng Linear cuối cùng chiếu ra num_classes (không dùng kích hoạt phi tuyến)
+        heads.append(create_linearblock(mlps[-2], mlps[-1], norm_args=None, act_args=None))
+        self.head = nn.Sequential(*heads)
+
+    def forward(self, end_points):
+        """
+        Nhận vào từ Encoder:
+        - Có thể là bộ ba: (p, x, b)
+        - Hoặc trực tiếp tensor đặc trưng đã pool: [B, C]
+        """
+        # 1. Bóc tách tensor đặc trưng x và vector batch b
+        if isinstance(end_points, (list, tuple)):
+            # Nhận (p, x, b) từ PointNextEncoderPyG
+            _, x, b = end_points
+        else:
+            x, b = end_points, None
+
+        # 2. Thực hiện Global Pooling phân tán theo từng protein trong batch
+        if b is not None and self.global_feat is not None:
+            pooled_feats = []
+            for pool_type in self.global_feat:
+                if 'max' in pool_type:
+                    # Gom lấy giá trị lớn nhất của từng protein
+                    pooled_feats.append(global_max_pool(x, b))  # [B, C]
+                elif pool_type in ['avg', 'mean']:
+                    # Gom lấy giá trị trung bình của từng protein
+                    pooled_feats.append(global_mean_pool(x, b)) # [B, C]
+            
+            # Ghép đặc trưng thành vector duy nhất cho mỗi protein: [B, len(global_feat) * C]
+            feat = torch.cat(pooled_feats, dim=1)
+        else:
+            feat = x
+
+        # 3. Đưa qua MLP Head phân loại ra xác suất 7 lớp Enzyme: [B, num_classes]
+        logits = self.head(feat)
         return logits

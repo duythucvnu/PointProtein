@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.autograd import Function
 import math
 from openpoints.cpp.pointnet2_batch import pointnet2_cuda
-
+from torch_geometric.nn import fps as pyg_fps
 
 class BaseSampler(ABC):
     """If num_to_sample is provided, sample exactly
@@ -100,6 +100,22 @@ class FurthestPointSampling(Function):
     @staticmethod
     def backward(xyz, a=None):
         return None, None
+
+class PyGRatioFPS(nn.Module):
+    """
+    Ratio-based FPS for point cloud protein data
+    """
+    def __init__(self, ratio=0.5, random_start=True):
+        super().__init__()
+        self.ratio = ratio
+        self.random_start = random_start
+
+    def forward(self, pos, batch):
+        idx = pyg_fps(pos, batch, ratio=self.ratio, random_start=self.random_start)       
+        new_pos = pos[idx]
+        new_batch = batch[idx]
+        
+        return idx, new_pos, new_batch
 
 
 furthest_point_sample = FurthestPointSampling.apply
