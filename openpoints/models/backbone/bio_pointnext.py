@@ -4,7 +4,6 @@ from typing import List, Type
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import radius as pyg_radius
 from torch_geometric.nn import global_mean_pool, global_max_pool, fps
 from torch_geometric.utils import scatter
 
@@ -62,6 +61,71 @@ def pyg_fps(pos, batch, ratio=0.5, random_start=True):
         sampled_indices.append(b_indices[selected])
 
     return torch.cat(sampled_indices, dim=0)
+
+def pyg_radius(x, y, r, batch_x=None, batch_y=None, max_num_neighbors=32):
+    """
+    Thuật toán Ball Query (Radius Graph) thuần PyTorch 100%.
+    Không cần pyg-lib hay torch_cluster, chạy cực nhanh và ổn định trên GPU.
+    
+    Đầu vào:
+        x: Tập điểm nguồn (support points) [N_x, 3]
+        y: Tập điểm đích/tâm (query points) [N_y, 3]
+        r: Bán kính cầu (Ångström)
+    Trả về:
+        row: Chỉ số điểm tâm (trong y)
+        col: Chỉ số điểm lân cận (trong x)
+    """
+    # 1. Thử dùng torch_cluster nếu có sẵn
+    try:
+        from torch_cluster import radius as cluster_radius
+        edge_index = cluster_radius(x, y, r, batch_x, batch_y, max_num_neighbors=max_num_neighbors)
+        return edge_index[0], edge_index[1]
+    except (ImportError, Exception):
+        pass
+
+    # 2. Triển khai thuần PyTorch trên GPU qua cdist + topk
+    if batch_x is None:
+        batch_x = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+    if batch_y is None:
+        batch_y = torch.zeros(y.size(0), dtype=torch.long, device=y.device)
+
+    batch_size = int(max(batch_x.max().item(), batch_y.max().item())) + 1
+    rows, cols = [], []
+
+    for b in range(batch_size):
+        idx_x = torch.nonzero(batch_x == b, as_tuple=True)[0]
+        idx_y = torch.nonzero(batch_y == b, as_tuple=True)[0]
+
+        if idx_x.numel() == 0 or idx_y.numel() == 0:
+            continue
+
+        xb = x[idx_x]  # [N_x, 3]
+        yb = y[idx_y]  # [N_y, 3]
+
+        # Tính toán ma trận khoảng cách giữa tất cả các cặp điểm trong protein này
+        dist = torch.cdist(yb, xb)  # [N_y, N_x]
+
+        # Lấy tối đa K lân cận gần nhất
+        k = min(max_num_neighbors, xb.size(0))
+        topk_dists, topk_indices = torch.topk(dist, k=k, dim=-1, largest=False)
+
+        # Lọc những điểm nằm thực sự trong bán kính r (<= r)
+        valid_mask = topk_dists <= r  # [N_y, k] (bool)
+        valid_r, valid_k = torch.nonzero(valid_mask, as_tuple=True)
+
+        # Ánh xạ ngược về chỉ số toàn cục (Global Index)
+        rows.append(idx_y[valid_r])
+        cols.append(idx_x[topk_indices[valid_r, valid_k]])
+
+    if len(rows) > 0:
+        row = torch.cat(rows, dim=0)
+        col = torch.cat(cols, dim=0)
+    else:
+        row = torch.empty(0, dtype=torch.long, device=x.device)
+        col = torch.empty(0, dtype=torch.long, device=x.device)
+
+    return row, col
+
 
 class LocalAggregation(nn.Module):
     """Local aggregation layer for a set (PyG Sparse Batching version).
