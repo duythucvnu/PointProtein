@@ -4,7 +4,8 @@ from typing import List, Type
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import radius, fps, global_mean_pool, global_max_pool
+from torch_geometric.nn import fps as pyg_fps, radius as pyg_radius
+from torch_geometric.nn import global_mean_pool, global_max_pool
 from torch_geometric.utils import scatter
 
 from ..build import MODELS
