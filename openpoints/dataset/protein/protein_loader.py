@@ -15,7 +15,7 @@ class ProteinEC(Dataset):
     collate_fn = concat_collate_fn  # <-- BẬT TỰ ĐỘNG GOM BATCH BIẾN THIÊN CỦA OPENPOINTS
 
     def __init__(self,
-                 data_dir="/kaggle/working/data/random",
+                 data_dir="",
                  split='train',
                  use_features=False,  # False: Baseline chỉ dùng XYZ; True: Dùng 22 đặc trưng sinh hóa
                  transform=None,
