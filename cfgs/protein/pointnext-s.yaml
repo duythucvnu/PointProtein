@@ -35,6 +35,7 @@ model:
   cls_args: 
     NAME: ClsHeadPyG 
     num_classes: 7
+    classes: ['Oxidoreductases', 'Transferases', 'Hydrolases', 'Lyases', 'Isomerases', 'Ligases', 'Translocases']
     mlps: [512, 256]
     norm_args: 
       norm: 'bn1d'
