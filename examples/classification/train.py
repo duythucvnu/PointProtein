@@ -116,7 +116,7 @@ def main(gpu, cfg, profile=False):
                  f"number of points sampled from dataset: {num_points}, "
                  f"number of points as model input: {cfg.num_points}")
     cfg.classes = cfg.get('classes', None) or val_loader.dataset.classes if hasattr(
-        val_loader.dataset, 'classes') else None or np.range(num_classes)
+    val_loader.dataset, 'classes') else None or np.range(num_classes)
     validate_fn = eval(cfg.get('val_fn', 'validate'))
 
     # optionally resume from a checkpoint
@@ -231,44 +231,39 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
     cm = ConfusionMatrix(num_classes=cfg.num_classes)
     npoints = cfg.num_points
 
-    model.train()  # set model to training mode
+    model.train()  # Chuyển mô hình sang chế độ train
     pbar = tqdm(enumerate(train_loader), total=train_loader.__len__())
     num_iter = 0
     for idx, data in pbar:
         for key in data.keys():
             data[key] = data[key].cuda(non_blocking=True)
         num_iter += 1
-        points = data['x']
         target = data['y']
-        """ bebug
-        from openpoints.dataset import vis_points
-        vis_points(data['pos'].cpu().numpy()[0])
-        """
-        num_curr_pts = points.shape[1]
-        if num_curr_pts > npoints:  # point resampling strategy
-            if npoints == 1024:
-                point_all = 1200
-            elif npoints == 4096:
-                point_all = 4800
-            elif npoints == 8192:
-                point_all = 8192
-            else:
-                raise NotImplementedError()
-            if  points.size(1) < point_all:
-                point_all = points.size(1)
-            fps_idx = furthest_point_sample(
-                points[:, :, :3].contiguous(), point_all)
-            fps_idx = fps_idx[:, np.random.choice(
-                point_all, npoints, False)]
-            points = torch.gather(
-                points, 1, fps_idx.unsqueeze(-1).long().expand(-1, -1, points.shape[-1]))
 
-        data['pos'] = points[:, :, :3].contiguous()
-        data['x'] = points[:, :, :cfg.model.in_channels].transpose(1, 2).contiguous()
+        # KIỂM TRA ĐỊNH DẠNG DỮ LIỆU:
+        if 'batch' in data:
+            # === NHÁNH DỮ LIỆU PROTEIN (PyG Sparse Batching) ===
+            # Dữ liệu đã sạch, độ dài tự nhiên, pos và x đã sẵn sàng [Total_N, C]
+            # Không cắt lát 3D, đưa thẳng vào model
+            pass
+        else:
+            # === NHÁNH VẬT THỂ CAD DENSE [B, N, C] GỐC ===
+            points = data['x']
+            num_curr_pts = points.shape[1]
+            if num_curr_pts > npoints:
+                point_all = 1200 if npoints == 1024 else points.size(1)
+                fps_idx = furthest_point_sample(points[:, :, :3].contiguous(), point_all)
+                fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
+                points = torch.gather(points, 1, fps_idx.unsqueeze(-1).long().expand(-1, -1, points.shape[-1]))
+
+            data['pos'] = points[:, :, :3].contiguous()
+            data['x'] = points[:, :, :cfg.model.in_channels].transpose(1, 2).contiguous()
+
+        # Chạy forward và tính loss
         logits, loss = model.get_logits_loss(data, target) if not hasattr(model, 'module') else model.module.get_logits_loss(data, target)
         loss.backward()
 
-        # optimize
+        # Cập nhật trọng số (Optimizer step)
         if num_iter == cfg.step_per_update:
             if cfg.get('grad_norm_clip') is not None and cfg.grad_norm_clip > 0.:
                 torch.nn.utils.clip_grad_norm_(
@@ -279,19 +274,22 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, cfg):
             if not cfg.sched_on_epoch:
                 scheduler.step(epoch)
 
-        # update confusion matrix
-        cm.update(logits.argmax(dim=1), target)
+        # Cập nhật Confusion Matrix và Loss
+        # target có thể là [B, 1] hoặc [B], ép phẳng về 1D [B]
+        target_flat = target.view(-1)
+        cm.update(logits.argmax(dim=1), target_flat)
         loss_meter.update(loss.item())
         if idx % cfg.print_freq == 0:
             pbar.set_description(f"Train Epoch [{epoch}/{cfg.epochs}] "
                                  f"Loss {loss_meter.val:.3f} Acc {cm.overall_accuray:.2f}")
+
     macc, overallacc, accs = cm.all_acc()
     return loss_meter.avg, macc, overallacc, accs, cm
 
 
 @torch.no_grad()
 def validate(model, val_loader, cfg):
-    model.eval()  # set model to eval mode
+    model.eval()  # Chuyển mô hình sang chế độ eval
     cm = ConfusionMatrix(num_classes=cfg.num_classes)
     npoints = cfg.num_points
     pbar = tqdm(enumerate(val_loader), total=val_loader.__len__())
@@ -299,12 +297,19 @@ def validate(model, val_loader, cfg):
         for key in data.keys():
             data[key] = data[key].cuda(non_blocking=True)
         target = data['y']
-        points = data['x']
-        points = points[:, :npoints]
-        data['pos'] = points[:, :, :3].contiguous()
-        data['x'] = points[:, :, :cfg.model.in_channels].transpose(1, 2).contiguous()
+
+        if 'batch' in data:
+            pass
+        else:
+            points = data['x']
+            points = points[:, :npoints]
+            data['pos'] = points[:, :, :3].contiguous()
+            data['x'] = points[:, :, :cfg.model.in_channels].transpose(1, 2).contiguous()
+
         logits = model(data)
-        cm.update(logits.argmax(dim=1), target)
+        
+        target_flat = target.view(-1)
+        cm.update(logits.argmax(dim=1), target_flat)
 
     tp, count = cm.tp, cm.count
     if cfg.distributed:
