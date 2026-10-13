@@ -4,8 +4,8 @@ from typing import List, Type
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import fps as pyg_fps, radius as pyg_radius
-from torch_geometric.nn import global_mean_pool, global_max_pool
+from torch_geometric.nn import radius as pyg_radius
+from torch_geometric.nn import global_mean_pool, global_max_pool, fps
 from torch_geometric.utils import scatter
 
 from ..build import MODELS
@@ -21,6 +21,47 @@ def get_reduction_fn(reduction):
     return lambda x, index, dim_size: scatter(
         x, index, dim=0, dim_size=dim_size, reduce=reduction
     )
+
+def pyg_fps(pos, batch, ratio=0.5, random_start=True):
+    """
+    Thuật toán Furthest Point Sampling thuần PyTorch hỗ trợ Sparse Batching (PyG).
+    Không cần cài đặt pyg-lib hay build C++, chạy mượt mà trên GPU Kaggle.
+    """
+    try:
+        from torch_cluster import fps as cluster_fps
+        return cluster_fps(pos, batch, ratio=ratio, random_start=random_start)
+    except (ImportError, Exception):
+        pass
+
+    batch_size = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
+    sampled_indices = []
+
+    for b in range(batch_size):
+        mask = (batch == b)
+        b_indices = torch.nonzero(mask, as_tuple=True)[0]
+        n_pts = b_indices.size(0)
+        k = max(1, int(n_pts * ratio))
+
+        if k >= n_pts:
+            sampled_indices.append(b_indices)
+            continue
+
+        p = pos[b_indices]  # [N_b, 3]
+        selected = torch.empty(k, dtype=torch.long, device=pos.device)
+        dists = torch.full((n_pts,), float('inf'), device=pos.device)
+
+        farthest_idx = torch.randint(0, n_pts, (1,), device=pos.device).item() if random_start else 0
+
+        for i in range(k):
+            selected[i] = farthest_idx
+            cur_p = p[farthest_idx]
+            d = torch.sum((p - cur_p) ** 2, dim=-1)
+            dists = torch.min(dists, d)
+            farthest_idx = torch.argmax(dists).item()
+
+        sampled_indices.append(b_indices[selected])
+
+    return torch.cat(sampled_indices, dim=0)
 
 class LocalAggregation(nn.Module):
     """Local aggregation layer for a set (PyG Sparse Batching version).
