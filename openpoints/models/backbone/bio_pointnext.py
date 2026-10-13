@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.nn import radius, fps, global_mean_pool, global_max_pool
-from torch_scatter import scatter
+from torch_geometric.utils import scatter
 from typing import List, Type
 import logging
 from ..build import MODELS
