@@ -1,12 +1,18 @@
+import copy
+import logging
+from typing import List, Type
+
 import torch
 import torch.nn as nn
 from torch_geometric.nn import radius, fps, global_mean_pool, global_max_pool
 from torch_geometric.utils import scatter
-from typing import List, Type
-import logging
+
 from ..build import MODELS
-from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
-    create_grouper, furthest_point_sample, random_sample, three_interpolation, get_aggregation_feautres
+from ..layers import (
+    create_convblock1d, create_convblock2d, create_linearblock,
+    create_act, CHANNEL_MAP, create_grouper, furthest_point_sample,
+    random_sample, three_interpolation, get_aggregation_feautres
+)
 
 def get_reduction_fn(reduction):
     reduction = 'mean' if reduction.lower() == 'avg' else reduction.lower()
