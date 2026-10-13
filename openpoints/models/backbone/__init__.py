@@ -9,4 +9,4 @@ from .pointvit_inv import InvPointViT
 from .pct import Pct
 from .curvenet import CurveNet
 from .simpleview import MVModel
-from .bio_pointnext import BioPointNeXtClassifier
+from .bio_pointnext import PointNextEncoderPyG
