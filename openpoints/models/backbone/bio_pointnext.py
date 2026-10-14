@@ -21,97 +21,6 @@ def get_reduction_fn(reduction):
     return lambda x, index, dim_size: scatter(
         x, index, dim=0, dim_size=dim_size, reduce=reduction
     )
-"""
-def pyg_fps(pos, batch, ratio=0.5, random_start=True):
-    try:
-        from torch_cluster import fps as cluster_fps
-        return cluster_fps(pos, batch, ratio=ratio, random_start=random_start)
-    except (ImportError, Exception):
-        pass
-
-    batch_size = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
-    sampled_indices = []
-
-    for b in range(batch_size):
-        mask = (batch == b)
-        b_indices = torch.nonzero(mask, as_tuple=True)[0]
-        n_pts = b_indices.size(0)
-        k = max(1, int(n_pts * ratio))
-
-        if k >= n_pts:
-            sampled_indices.append(b_indices)
-            continue
-
-        p = pos[b_indices]  # [N_b, 3]
-        selected = torch.empty(k, dtype=torch.long, device=pos.device)
-        dists = torch.full((n_pts,), float('inf'), device=pos.device)
-
-        farthest_idx = torch.randint(0, n_pts, (1,), device=pos.device).item() if random_start else 0
-
-        for i in range(k):
-            selected[i] = farthest_idx
-            cur_p = p[farthest_idx]
-            d = torch.sum((p - cur_p) ** 2, dim=-1)
-            dists = torch.min(dists, d)
-            farthest_idx = torch.argmax(dists).item()
-
-        sampled_indices.append(b_indices[selected])
-
-    return torch.cat(sampled_indices, dim=0)
-
-def pyg_radius(x, y, r, batch_x=None, batch_y=None, max_num_neighbors=32):
-
-    # 1. Thử dùng torch_cluster nếu có sẵn
-    try:
-        from torch_cluster import radius as cluster_radius
-        edge_index = cluster_radius(x, y, r, batch_x, batch_y, max_num_neighbors=max_num_neighbors)
-        return edge_index[0], edge_index[1]
-    except (ImportError, Exception):
-        pass
-
-    # 2. Triển khai thuần PyTorch trên GPU qua cdist + topk
-    if batch_x is None:
-        batch_x = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-    if batch_y is None:
-        batch_y = torch.zeros(y.size(0), dtype=torch.long, device=y.device)
-
-    batch_size = int(max(batch_x.max().item(), batch_y.max().item())) + 1
-    rows, cols = [], []
-
-    for b in range(batch_size):
-        idx_x = torch.nonzero(batch_x == b, as_tuple=True)[0]
-        idx_y = torch.nonzero(batch_y == b, as_tuple=True)[0]
-
-        if idx_x.numel() == 0 or idx_y.numel() == 0:
-            continue
-
-        xb = x[idx_x]  # [N_x, 3]
-        yb = y[idx_y]  # [N_y, 3]
-
-        # Tính toán ma trận khoảng cách giữa tất cả các cặp điểm trong protein này
-        dist = torch.cdist(yb, xb)  # [N_y, N_x]
-
-        # Lấy tối đa K lân cận gần nhất
-        k = min(max_num_neighbors, xb.size(0))
-        topk_dists, topk_indices = torch.topk(dist, k=k, dim=-1, largest=False)
-
-        # Lọc những điểm nằm thực sự trong bán kính r (<= r)
-        valid_mask = topk_dists <= r  # [N_y, k] (bool)
-        valid_r, valid_k = torch.nonzero(valid_mask, as_tuple=True)
-
-        # Ánh xạ ngược về chỉ số toàn cục (Global Index)
-        rows.append(idx_y[valid_r])
-        cols.append(idx_x[topk_indices[valid_r, valid_k]])
-
-    if len(rows) > 0:
-        row = torch.cat(rows, dim=0)
-        col = torch.cat(cols, dim=0)
-    else:
-        row = torch.empty(0, dtype=torch.long, device=x.device)
-        col = torch.empty(0, dtype=torch.long, device=x.device)
-
-    return row, col
-"""
 
 class LocalAggregation(nn.Module):
     """Local aggregation layer for a set (PyG Sparse Batching version).
@@ -462,13 +371,98 @@ class SetAbstraction(nn.Module):
 
         return new_p, new_x, new_b
 
+
+class TriModalStem(nn.Module):
+    """
+    STAGE 1: Multimodal fusion block for proteins.
+    - Branch 1: 3D Coordinates (Structure)
+    - Branch 2: 20 Amino Acid One-hot Encoding (Sequence)
+    - Branch 3: SASA & RSA (Surface)
+    Fusion is performed using the FiLM mechanism,
+    where biochemical and surface information modulate
+    the 3D geometric features.
+    """
+
+    def __init__(self, out_channels=32):
+        super().__init__()
+
+        # 1. Structure Branch (xyz coordinates: 3 dimensions)
+        self.geo_branch = nn.Sequential(
+            nn.Linear(3, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 2. Sequence Branch (20 amino acid one-hot encoding: 20 dimensions)
+        self.seq_branch = nn.Sequential(
+            nn.Linear(20, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_channels, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels)
+        )
+
+        # 3. Surface Branch (SASA & RSA: 2 dimensions)
+        self.surf_branch = nn.Sequential(
+            nn.Linear(2, out_channels // 2, bias=False),
+            nn.BatchNorm1d(out_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_channels // 2, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels)
+        )
+
+        # 4. FiLM Modulation Parameter Generator (from Sequence + Surface)
+        self.film_generator = nn.Sequential(
+            nn.Linear(out_channels * 2, out_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_channels * 2, out_channels * 2)
+            # The first half represents gamma; the second half represents beta.
+        )
+
+        self.out_act = nn.ReLU(inplace=True)
+
+    def forward(self, p, x):
+        """
+        Inputs:
+            p: [Total_N, 3]  -> xyz coordinates
+            x: [Total_N, 22] -> Contains [0:20] amino acid one-hot encoding
+                               and [20:22] SASA/RSA features
+
+        Output:
+            x_fused: [Total_N, out_channels] -> Modulated feature representation
+        """
+
+        # Split the input features
+        seq_feat = x[:, :20]      # 20-dimensional one-hot encoding
+        surf_feat = x[:, 20:22]   # 2-dimensional SASA and RSA features
+
+        # 1. Extract features independently through each branch
+        f_geo = self.geo_branch(p)
+        f_seq = self.seq_branch(seq_feat)
+        f_surf = self.surf_branch(surf_feat)
+
+        # 2. Generate FiLM parameters from biochemical and surface information
+        bio_context = torch.cat([f_seq, f_surf], dim=-1)
+        film_params = self.film_generator(bio_context)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)
+
+        # 3. Modulate geometric features using FiLM: scaling and shifting
+        # gamma is transformed using (1 + tanh) to ensure stable scaling
+        # around 1.0
+        gamma = 1.0 + torch.tanh(gamma)
+
+        f_fused = gamma * f_geo + beta
+        f_fused = self.out_act(f_fused)
+
+        return f_fused
+
+
 @MODELS.register_module()
 class PointNextEncoderPyG(nn.Module):
-    r"""The PyG-compatible Encoder for PointNeXt supporting variable-sized point clouds.
+    """The PyG-compatible Encoder for PointNeXt supporting variable-sized point clouds.
     `"PointNeXt: Revisiting PointNet++ with Improved Training and Scaling Strategies".
     <https://arxiv.org/abs/2206.04670>`_.
 
-    Tương thích 100% với tham số YAML của OpenPoints gốc.
     """
 
     def __init__(self,
@@ -521,6 +515,14 @@ class PointNextEncoderPyG(nn.Module):
 
         # 3. Lắp ráp các Stage tuần tự
         encoder = []
+        self.use_multimodal = kwargs.get('use_multimodal', True)
+        if self.use_multimodal:
+            self.stem = TriModalStem(out_channels=width)
+            self.in_channels = width  # Đặc trưng sau Stem đã có số kênh là width
+        else:
+            self.stem = None
+            self.in_channels = in_channels
+
         for i in range(len(blocks)):
             # Deepcopy group_args để không bị ghi đè tham số giữa các stage
             stage_group_args = copy.deepcopy(group_args)
@@ -611,23 +613,21 @@ class PointNextEncoderPyG(nn.Module):
         return nn.Sequential(*layers)
 
     def forward_cls_feat(self, p0, f0=None, batch0=None):
-        """Trích xuất đặc trưng cho bài toán phân loại (Classification)."""
-        # 1. Tự động bóc tách nếu đầu vào là dict (từ concat_collate_fn) hoặc PyG Batch
         if hasattr(p0, 'keys'):
             p0, f0, batch0 = p0['pos'], p0.get('x', None), p0.get('batch', None)
         elif hasattr(p0, 'pos'):
             p0, f0, batch0 = p0.pos, getattr(p0, 'x', None), getattr(p0, 'batch', None)
 
-        # Baseline: Nếu f0 không có, lấy chính tọa độ (x, y, z) làm đặc trưng khởi đầu
         if f0 is None:
             f0 = p0.clone()
 
-        # 2. Cho dữ liệu đi qua lần lượt từng Stage
+        if self.use_multimodal and self.stem is not None:
+            f0 = self.stem(p0, f0)
+
         p, x, b = p0, f0, batch0
         for stage in self.encoder:
             p, x, b = stage([p, x, b])
 
-        # 3. Trả về bộ 3 sau cùng để Classifier Head làm Global Pooling
         return p, x, b
 
     def forward(self, p0, f0=None, batch0=None):

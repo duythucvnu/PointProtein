@@ -4,7 +4,7 @@ num_points: 1024
 dataset:
   common:
     NAME: ProteinEC
-    use_features: False
+    use_features: True
     data_dir: '/kaggle/input/datasets/duythucai/protein/data/random'
   train:
     split: train
