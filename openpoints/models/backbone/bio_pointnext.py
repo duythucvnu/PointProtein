@@ -4,6 +4,8 @@ from typing import List, Type
 
 import torch
 import torch.nn as nn
+import numpy as np
+
 from torch_geometric.nn import fps as pyg_fps, radius as pyg_radius
 from torch_geometric.nn import global_mean_pool, global_max_pool, fps
 from torch_geometric.utils import scatter
@@ -372,85 +374,103 @@ class SetAbstraction(nn.Module):
         return new_p, new_x, new_b
 
 
+class GaussianRBF(nn.Module):
+    """
+    Hàm cơ sở bán kính Gauss (Gaussian Radial Basis Functions).
+    Biến đổi một đại lượng vô hướng liên tục (như SASA/RSA) thành vector K-chiều phân bố phi tuyến.
+    """
+    def __init__(self, start=0.0, stop=1.0, num_kernels=16):
+        super().__init__()
+        # Tạo K tâm Gauss rải đều từ start đến stop
+        offset = torch.linspace(start, stop, num_kernels)
+        self.register_buffer('offset', offset)
+        # Độ rộng sigma tương ứng với khoảng cách giữa các tâm
+        self.coeff = -0.5 / ((stop - start) / (num_kernels - 1)) ** 2
+
+    def forward(self, v):
+        # v: [N, 1] -> output: [N, num_kernels]
+        return torch.exp(self.coeff * (v - self.offset) ** 2)
+
+
 class TriModalStem(nn.Module):
     """
-    STAGE 1: Multimodal fusion block for proteins.
-    - Branch 1: 3D Coordinates (Structure)
-    - Branch 2: 20 Amino Acid One-hot Encoding (Sequence)
-    - Branch 3: SASA & RSA (Surface)
-    Fusion is performed using the FiLM mechanism,
-    where biochemical and surface information modulate
-    the 3D geometric features.
+    Khối dung hợp Đa phương thức CHUẨN MỰC:
+    - Nhánh 1 (Structure): Tọa độ 3D -> MLP trích xuất hình học
+    - Nhánh 2 (Sequence): One-hot Amino Acid -> Linear Embedding + Tầng tương tác đặc trưng
+    - Nhánh 3 (Surface): SASA & RSA -> Mở rộng bằng Gaussian RBF (32 chiều) -> Surface MLP
+    - Dung hợp: Gated FiLM Modulation
     """
-
     def __init__(self, out_channels=32):
         super().__init__()
-
-        # 1. Structure Branch (xyz coordinates: 3 dimensions)
+        
+        # 1. NHÁNH STRUCTURE (Tọa độ xyz: 3 chiều)
         self.geo_branch = nn.Sequential(
             nn.Linear(3, out_channels, bias=False),
             nn.BatchNorm1d(out_channels),
             nn.ReLU(inplace=True)
         )
 
-        # 2. Sequence Branch (20 amino acid one-hot encoding: 20 dimensions)
+        # 2. NHÁNH SEQUENCE (20 Axit Amin)
+        # Linear(20, out_channels, bias=False) tương đương toán học với nn.Embedding(20, out_channels)
         self.seq_branch = nn.Sequential(
             nn.Linear(20, out_channels, bias=False),
             nn.BatchNorm1d(out_channels),
             nn.ReLU(inplace=True),
             nn.Linear(out_channels, out_channels, bias=False),
-            nn.BatchNorm1d(out_channels)
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
-        # 3. Surface Branch (SASA & RSA: 2 dimensions)
+        # 3. NHÁNH SURFACE (SASA & RSA qua Gaussian RBF)
+        # Mở rộng SASA (0-300 Å^2) thành 16 bins; RSA (0.0-1.0) thành 16 bins -> Tổng 32 chiều
+        self.rbf_sasa = GaussianRBF(start=0.0, stop=300.0, num_kernels=16)
+        self.rbf_rsa = GaussianRBF(start=0.0, stop=1.0, num_kernels=16)
+        
         self.surf_branch = nn.Sequential(
-            nn.Linear(2, out_channels // 2, bias=False),
-            nn.BatchNorm1d(out_channels // 2),
+            nn.Linear(32, out_channels, bias=False), # Nhận 32 chiều từ RBF
+            nn.BatchNorm1d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Linear(out_channels // 2, out_channels, bias=False),
-            nn.BatchNorm1d(out_channels)
+            nn.Linear(out_channels, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
-        # 4. FiLM Modulation Parameter Generator (from Sequence + Surface)
+        # 4. BỘ ĐIỀU HÒA FiLM (Tạo hệ số co giãn gamma và độ lệch beta)
+        # Kết hợp thông tin sinh học (Sequence) và vi môi trường (Surface)
         self.film_generator = nn.Sequential(
             nn.Linear(out_channels * 2, out_channels * 2),
             nn.ReLU(inplace=True),
             nn.Linear(out_channels * 2, out_channels * 2)
-            # The first half represents gamma; the second half represents beta.
         )
-
         self.out_act = nn.ReLU(inplace=True)
 
     def forward(self, p, x):
         """
-        Inputs:
-            p: [Total_N, 3]  -> xyz coordinates
-            x: [Total_N, 22] -> Contains [0:20] amino acid one-hot encoding
-                               and [20:22] SASA/RSA features
-
-        Output:
-            x_fused: [Total_N, out_channels] -> Modulated feature representation
+        Đầu vào:
+            p: [Total_N, 3]  -> Tọa độ xyz
+            x: [Total_N, 22] -> x[:, :20] là One-hot; x[:, 20:21] là SASA; x[:, 21:22] là RSA
         """
+        seq_onehot = x[:, :20]
+        sasa_val   = x[:, 20:21]
+        rsa_val    = x[:, 21:22]
 
-        # Split the input features
-        seq_feat = x[:, :20]      # 20-dimensional one-hot encoding
-        surf_feat = x[:, 20:22]   # 2-dimensional SASA and RSA features
-
-        # 1. Extract features independently through each branch
+        # 1. Trích xuất đặc trưng từng nhánh
         f_geo = self.geo_branch(p)
-        f_seq = self.seq_branch(seq_feat)
-        f_surf = self.surf_branch(surf_feat)
+        f_seq = self.seq_branch(seq_onehot)
+        
+        # Mở rộng RBF phi tuyến cho bề mặt
+        sasa_rbf = self.rbf_sasa(sasa_val) # [Total_N, 16]
+        rsa_rbf  = self.rbf_rsa(rsa_val)   # [Total_N, 16]
+        surf_rbf = torch.cat([sasa_rbf, rsa_rbf], dim=-1) # [Total_N, 32]
+        f_surf   = self.surf_branch(surf_rbf)
 
-        # 2. Generate FiLM parameters from biochemical and surface information
+        # 2. Sinh trọng số FiLM từ [Sequence + Surface]
         bio_context = torch.cat([f_seq, f_surf], dim=-1)
         film_params = self.film_generator(bio_context)
         gamma, beta = torch.chunk(film_params, 2, dim=-1)
 
-        # 3. Modulate geometric features using FiLM: scaling and shifting
-        # gamma is transformed using (1 + tanh) to ensure stable scaling
-        # around 1.0
-        gamma = 1.0 + torch.tanh(gamma)
-
+        # 3. Điều hòa hình học (FiLM): gamma * f_geo + beta
+        gamma = 1.0 + torch.tanh(gamma)  # Co giãn ổn định quanh mức 1.0
         f_fused = gamma * f_geo + beta
         f_fused = self.out_act(f_fused)
 
