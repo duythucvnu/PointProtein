@@ -78,7 +78,7 @@ class LocalAggregation(nn.Module):
         Total_N = p.shape[0]
 
         # 1. Quét lân cận
-        row, col = safe_radius(p, p, self.radius, b, b, max_num_neighbors=self.nsample)
+        row, col = pyg_radius(p, p, self.radius, b, b, max_num_neighbors=self.nsample)
 
         # 2. Vector tọa độ tương đối dp [E, 3]
         diff = p[col] - p[row]
@@ -279,7 +279,7 @@ class SetAbstraction(nn.Module):
             identity = self.skipconv(x[idx])
 
         # 2. Quét lân cận hai tập điểm
-        row, col = safe_radius(p, new_p, self.radius, b, new_b, max_num_neighbors=self.nsample)
+        row, col = pyg_radius(p, new_p, self.radius, b, new_b, max_num_neighbors=self.nsample)
 
         # 3. Vector tọa độ tương đối dp [E, 3]
         diff = p[col] - new_p[row]
