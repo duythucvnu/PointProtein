@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import logging
 from typing import List
+from torch_scatter import scatter_softmax
 from torch_geometric.nn import global_mean_pool, global_max_pool
 from ..layers import create_linearblock
 from ...utils import get_missing_parameters_message, get_unexpected_parameters_message
@@ -139,75 +140,97 @@ class ClsHead(nn.Module):
 @MODELS.register_module()
 class ClsHeadPyG(nn.Module):
     """
-    Classification Head tương thích 100% với PyG Sparse Batching.
-    Tôn trọng toàn bộ tham số YAML của ClsHead gốc.
+    TẦNG 3: CLASSIFIER HEAD TÍCH HỢP GATED MULTIMODAL UNIT (GMU)
+    - Nhánh 1 (Z_fold): Nếp gấp khung xương 3D toàn thể qua Mean Pooling
+    - Nhánh 2 (Z_pocket): Túi phản ứng hoạt tính qua Attentive Pooling + Max Pooling
+    - Dung hợp: Cổng động GMU tự học tỷ trọng cân bằng giữa Khung xương và Túi xúc tác.
     """
     def __init__(self,
-                 num_classes: int,
-                 in_channels: int,
-                 mlps: List[int] = [256],
+                 num_classes: int = 7,
+                 in_channels: int = 512,
+                 mlps: List[int] = [512, 256],
                  norm_args: dict = {'norm': 'bn1d'},
                  act_args: dict = {'act': 'relu'},
                  dropout: float = 0.5,
-                 global_feat: str = 'max,avg',   # Mặc định kết hợp cả Max Pool và Mean Pool
                  **kwargs
                  ):
         super().__init__()
-        if kwargs:
-            logging.warning(f"kwargs: {kwargs} are not used in {__class__.__name__}")
-
-        self.global_feat = global_feat.split(',') if global_feat is not None else ['max']
         
-        # Nếu dùng cả 'max' và 'avg', số kênh đầu vào của MLP sẽ nhân đôi (len(global_feat) * in_channels)
-        in_dim = len(self.global_feat) * in_channels if global_feat is not None else in_channels
-        
-        if mlps is not None:
-            mlps = [in_dim] + mlps + [num_classes]
-        else:
-            mlps = [in_dim, num_classes]
+        # 1. Nhánh Pocket: Học trọng số chú ý để tìm túi xúc tác
+        self.att_score = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // 4, 1)
+        )
+        self.pocket_proj = nn.Sequential(
+            nn.Linear(in_channels * 2, in_channels, bias=False),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True)
+        )
 
-        # Xây dựng chuỗi MLP phân loại (Linear + Norm + Act + Dropout)
+        # 2. Các tầng chiếu độc lập cho 2 nhánh trước khi vào GMU
+        self.proj_fold = nn.Sequential(
+            nn.Linear(in_channels, in_channels, bias=False),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.proj_pocket = nn.Sequential(
+            nn.Linear(in_channels, in_channels, bias=False),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 3. Cổng điều hòa GMU (Gated Multimodal Unit)
+        self.gmu_gate = nn.Sequential(
+            nn.Linear(in_channels * 2, in_channels),
+            nn.BatchNorm1d(in_channels),
+            nn.Sigmoid()
+        )
+
+        # 4. MLP phân loại chính (đưa từ in_channels về num_classes)
         heads = []
-        for i in range(len(mlps) - 2):
-            heads.append(create_linearblock(mlps[i], mlps[i + 1],
-                                            norm_args=norm_args,
-                                            act_args=act_args))
+        curr_c = in_channels
+        for h_dim in mlps:
+            heads.append(create_linearblock(curr_c, h_dim, norm_args=norm_args, act_args=act_args))
             if dropout > 0:
                 heads.append(nn.Dropout(dropout))
-        
-        # Tầng Linear cuối cùng chiếu ra num_classes (không dùng kích hoạt phi tuyến)
-        heads.append(create_linearblock(mlps[-2], mlps[-1], norm_args=None, act_args=None))
+            curr_c = h_dim
+            
+        heads.append(create_linearblock(curr_c, num_classes, norm_args=None, act_args=None))
         self.head = nn.Sequential(*heads)
 
     def forward(self, end_points):
-        """
-        Nhận vào từ Encoder:
-        - Có thể là bộ ba: (p, x, b)
-        - Hoặc trực tiếp tensor đặc trưng đã pool: [B, C]
-        """
-        # 1. Bóc tách tensor đặc trưng x và vector batch b
+        # 1. Bóc tách bộ ba (p, x, b) trả về từ PointNextEncoderPyG
         if isinstance(end_points, (list, tuple)):
-            # Nhận (p, x, b) từ PointNextEncoderPyG
             _, x, b = end_points
         else:
             x, b = end_points, None
 
-        # 2. Thực hiện Global Pooling phân tán theo từng protein trong batch
-        if b is not None and self.global_feat is not None:
-            pooled_feats = []
-            for pool_type in self.global_feat:
-                if 'max' in pool_type:
-                    # Gom lấy giá trị lớn nhất của từng protein
-                    pooled_feats.append(global_max_pool(x, b))  # [B, C]
-                elif pool_type in ['avg', 'mean']:
-                    # Gom lấy giá trị trung bình của từng protein
-                    pooled_feats.append(global_mean_pool(x, b)) # [B, C]
-            
-            # Ghép đặc trưng thành vector duy nhất cho mỗi protein: [B, len(global_feat) * C]
-            feat = torch.cat(pooled_feats, dim=1)
-        else:
-            feat = x
+        if b is not None:
+            # === NHÁNH 1: HÌNH THÁI NẾP GẤP TOÀN THỂ (Z_fold) ===
+            z_fold = global_mean_pool(x, b)  # [B, in_channels]
 
-        # 3. Đưa qua MLP Head phân loại ra xác suất 7 lớp Enzyme: [B, num_classes]
-        logits = self.head(feat)
+            # === NHÁNH 2: TÚI XÚC TÁC HOẠT TÍNH (Z_pocket) ===
+            # Tính điểm chú ý cho từng điểm trong mỗi protein
+            scores = self.att_score(x)                           # [Total_N, 1]
+            attn_weights = scatter_softmax(scores, b, dim=0)     # Softmax phân tán theo vector batch
+            z_attn = global_mean_pool(x * attn_weights, b)       # Điểm nào là túi xúc tác sẽ có trọng số cao
+            z_max  = global_max_pool(x, b)                       # Lấy giá trị cực đại nổi bật
+            
+            # Kết hợp Attention và Max để mô tả toàn diện túi hoạt tính
+            z_pocket_raw = torch.cat([z_attn, z_max], dim=-1)   # [B, 2 * in_channels]
+            z_pocket = self.pocket_proj(z_pocket_raw)            # [B, in_channels]
+
+            # === NHÁNH 3: DUNG HỢP BẰNG CỔNG GMU ===
+            # Học tỷ trọng cân bằng alpha in (0, 1) cho từng protein
+            gate_input = torch.cat([z_fold, z_pocket], dim=-1)   # [B, 2 * in_channels]
+            alpha = self.gmu_gate(gate_input)                    # [B, in_channels]
+
+            # Dung hợp đặc trưng: Điều hòa thích ứng giữa nếp gấp và túi xúc tác
+            z_fused = alpha * self.proj_fold(z_fold) + (1.0 - alpha) * self.proj_pocket(z_pocket)
+        else:
+            z_fused = x
+
+        # 4. Dự đoán xác suất 7 lớp Enzyme Commission
+        logits = self.head(z_fused)
         return logits
