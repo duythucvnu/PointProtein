@@ -17,6 +17,103 @@ from ..layers import (
     random_sample, three_interpolation, get_aggregation_feautres
 )
 
+
+def _fast_fps_single(p, ratio=0.5, random_start=True):
+    """Chạy trực tiếp pyg_fps trên 1 tập điểm con."""
+    if p.size(0) == 0:
+        return torch.empty(0, dtype=torch.long, device=p.device)
+    if ratio >= 1.0:
+        return torch.arange(p.size(0), device=p.device)
+
+    # Gọi thẳng C++ kernel của PyG (siêu nhanh)
+    return pyg_fps(p, ratio=ratio, random_start=random_start)
+
+
+def stratified_fps(pos, batch, rsa, ratio=0.5,
+                   quotas=(0.25, 0.50, 0.25),
+                   thresholds=(0.15, 0.45),
+                   random_start=True):
+    """
+    GIAI ĐOẠN 3: Lấy mẫu Phân tầng (Stratified FPS) bảo tồn Túi hoạt tính.
+    Sử dụng trực tiếp pyg_fps của PyTorch Geometric.
+    """
+    if rsa.dim() > 1:
+        rsa = rsa.squeeze(-1)
+
+    th_low, th_high = thresholds
+    q_buried, q_pocket, q_exposed = quotas
+
+    batch_size = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
+    all_selected_indices = []
+
+    # Duyệt qua từng protein trong batch
+    for b in range(batch_size):
+        indices_b = torch.nonzero(batch == b, as_tuple=True)[0]
+        N_b = indices_b.size(0)
+        M_b = max(1, int(N_b * ratio))
+
+        if M_b >= N_b:
+            all_selected_indices.append(indices_b)
+            continue
+
+        pos_b = pos[indices_b]
+        rsa_b = rsa[indices_b]
+
+        # 1. Phân chia 3 tầng theo giá trị RSA
+        mask_1 = (rsa_b < th_low)                           # Buried
+        mask_2 = (rsa_b >= th_low) & (rsa_b <= th_high)     # Partially Exposed (Pocket)
+        mask_3 = (rsa_b > th_high)                          # Fully Exposed
+
+        n1 = int(mask_1.sum())
+        n2 = int(mask_2.sum())
+        n3 = int(mask_3.sum())
+
+        # 2. Phân bổ hạn ngạch (Quota)
+        k1 = int(M_b * q_buried)
+        k3 = int(M_b * q_exposed)
+        k2 = M_b - k1 - k3  # Ưu tiên phần lớn nhất cho túi xúc tác (~50%)
+
+        # 3. Cơ chế bù trừ hạn ngạch động (Deficit Redistribution)
+        surplus = 0
+        if k1 > n1:
+            surplus += (k1 - n1)
+            k1 = n1
+        if k3 > n3:
+            surplus += (k3 - n3)
+            k3 = n3
+        
+        k2 += surplus  # Dồn cho hốc xúc tác
+        if k2 > n2:
+            k2 = n2
+
+        remaining = M_b - (k1 + k2 + k3)
+        if remaining > 0 and (n1 - k1) > 0:
+            add1 = min(remaining, n1 - k1)
+            k1 += add1
+            remaining -= add1
+        if remaining > 0 and (n3 - k3) > 0:
+            add3 = min(remaining, n3 - k3)
+            k3 += add3
+
+        # 4. Chạy trực tiếp pyg_fps trên từng tầng
+        if k1 > 0 and n1 > 0:
+            idx1 = _fast_fps_single(pos_b[mask_1], ratio=k1 / n1, random_start=random_start)
+            all_selected_indices.append(indices_b[mask_1][idx1[:k1]])
+
+        if k2 > 0 and n2 > 0:
+            idx2 = _fast_fps_single(pos_b[mask_2], ratio=k2 / n2, random_start=random_start)
+            all_selected_indices.append(indices_b[mask_2][idx2[:k2]])
+
+        if k3 > 0 and n3 > 0:
+            idx3 = _fast_fps_single(pos_b[mask_3], ratio=k3 / n3, random_start=random_start)
+            all_selected_indices.append(indices_b[mask_3][idx3[:k3]])
+
+    if len(all_selected_indices) > 0:
+        return torch.cat(all_selected_indices, dim=0)
+    else:
+        return torch.arange(pos.size(0), device=pos.device)
+
+
 def get_reduction_fn(reduction):
     reduction = 'mean' if reduction.lower() == 'avg' else reduction.lower()
     assert reduction in ['sum', 'max', 'mean'], f"Unsupported reduction: {reduction}"
@@ -259,48 +356,75 @@ class SetAbstraction(nn.Module):
                 raise NotImplementedError(f"Sampler {sampler} not supported")
 
     def forward(self, pxb):
-        p, x, b = pxb
+        """
+        GIAI ĐOẠN 3: Tích hợp Stratified-FPS bảo tồn Túi hoạt tính.
+        
+        Đầu vào pxb có thể là:
+            - [p, x, b, rsa]: Khi chạy Stratified-FPS (có kèm mảng RSA)
+            - [p, x, b]: Khi chạy FPS thường (để tương thích ngược)
+        """
+        # 1. Bóc tách linh hoạt: kiểm tra xem có truyền mảng rsa kèm theo không
+        if len(pxb) == 4:
+            p, x, b, rsa = pxb
+        else:
+            p, x, b = pxb
+            rsa = None
 
+        # 2. Xử lý tầng Head (không hạ mẫu)
         if self.is_head:
             x = self.convs(x)
-            return p, x, b
+            return [p, x, b, rsa] if rsa is not None else [p, x, b]
 
-        # 1. Hạ mẫu bằng FPS theo tỷ lệ %
+        # 3. HẠ MẪU (DOWNSAMPLING): LỰA CHỌN THUẬT TOÁN LẤY MẪU
         if not self.all_aggr:
-            idx = self.sample_fn(p, b, ratio=(1.0 / self.stride))
+            # GIAI ĐOẠN 3: Nếu có mảng rsa và stride > 1 -> DÙNG STRATIFIED-FPS
+            if rsa is not None and self.stride > 1:
+                idx = stratified_fps(p, b, rsa, ratio=(1.0 / self.stride))
+                new_rsa = rsa[idx]  # Kế thừa giá trị RSA cho các tầng SA tiếp theo!
+            else:
+                idx = self.sample_fn(p, b, ratio=(1.0 / self.stride))
+                new_rsa = rsa[idx] if rsa is not None else None
+
             new_p = p[idx]
             new_b = b[idx]
         else:
             idx = None
             new_p = p
             new_b = b
+            new_rsa = rsa
 
+        # 4. Nhánh tắt phần dư (Skip connection)
         if self.use_res:
-            identity = self.skipconv(x[idx])
+            identity = self.skipconv(x[idx]) if idx is not None else self.skipconv(x)
 
-        # 2. Quét lân cận hai tập điểm
+        # 5. Quét lân cận hai tập điểm bằng PyG
         row, col = pyg_radius(p, new_p, self.radius, b, new_b, max_num_neighbors=self.nsample)
 
-        # 3. Vector tọa độ tương đối dp [E, 3]
+        # 6. Vector tọa độ tương đối dp
         diff = p[col] - new_p[row]
         dp = diff / self.radius if self.normalize_dp else diff
 
-        # 4. GIAI ĐOẠN 2: Tính khoảng cách Euclidean d_ij và chiếu qua Gaussian RBF
+        # 7. Khoảng cách Euclidean d_ij qua Gaussian RBF (Giai đoạn 2)
         dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)  # [E, 1]
         dist_rbf = self.rbf_dist(dist)                                        # [E, 16]
 
-        # 5. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
+        # 8. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
         xj = x[col]
         edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)
 
-        # 6. MLP và Max-pooling về các điểm tâm mới
+        # 9. Tích chập và Max-pooling về các điểm tâm mới
         edge_features = self.convs(edge_features)
         new_x = scatter(edge_features, row, dim=0, dim_size=new_p.size(0), reduce='max')
 
+        # 10. Cộng phần dư
         if self.use_res:
             new_x = self.act(new_x + identity)
 
-        return new_p, new_x, new_b
+        # 11. TRẢ VỀ: Đóng gói new_rsa đi tiếp sang các tầng sâu
+        if new_rsa is not None:
+            return [new_p, new_x, new_b, new_rsa]
+        else:
+            return [new_p, new_x, new_b]
 
 
 class GaussianRBF(nn.Module):
@@ -535,20 +659,19 @@ class PointNextEncoderPyG(nn.Module):
     def forward_cls_feat(self, p0, f0=None, batch0=None):
         if hasattr(p0, 'keys'):
             p0, f0, batch0 = p0['pos'], p0.get('x', None), p0.get('batch', None)
-        elif hasattr(p0, 'pos'):
-            p0, f0, batch0 = p0.pos, getattr(p0, 'x', None), getattr(p0, 'batch', None)
 
-        if f0 is None:
-            f0 = p0.clone()
+        raw_rsa = f0[:, 21].clone() if f0.shape[-1] >= 22 else None
 
-        # DUNG HỢP BẰNG SGBU CHUẨN SE(3)
+        # Qua tầng Stem SGBU
         if self.use_multimodal and self.stem is not None:
             f0 = self.stem(p0, f0)
 
-        p, x, b = p0, f0, batch0
+        # Đóng gói bộ 4 phần tử: [p, x, b, rsa]
+        pxb = [p0, f0, batch0, raw_rsa]
         for stage in self.encoder:
-            p, x, b = stage([p, x, b])
+            pxb = stage(pxb)
 
+        p, x, b = pxb[0], pxb[1], pxb[2]
         return p, x, b
 
     def forward(self, p0, f0=None, batch0=None):
