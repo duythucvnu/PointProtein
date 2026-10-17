@@ -7,7 +7,6 @@ import torch.nn as nn
 import numpy as np
 
 from torch_geometric.nn import fps as pyg_fps, radius as pyg_radius
-from torch_geometric.nn import knn as pyg_knn
 from torch_geometric.nn import global_mean_pool, global_max_pool, fps
 from torch_geometric.utils import scatter
 
@@ -24,23 +23,6 @@ def get_reduction_fn(reduction):
     return lambda x, index, dim_size: scatter(
         x, index, dim=0, dim_size=dim_size, reduce=reduction
     )
-
-def adaptive_knn(x, y, k, batch_x=None, batch_y=None):
-    if batch_x is not None:
-        counts = torch.bincount(batch_x)
-        counts = counts[counts > 0]
-        min_nodes = int(counts.min().item()) if counts.numel() > 0 else x.size(0)
-    else:
-        min_nodes = x.size(0)
-
-    safe_k = max(1, min(k, min_nodes))
-
-    edge_index = pyg_knn(x=x, y=y, k=safe_k, batch_x=batch_x, batch_y=batch_y)
-
-    row = edge_index[0]
-    col = edge_index[1]
-    return row, col
-
 
 class LocalAggregation(nn.Module):
     """
@@ -90,34 +72,28 @@ class LocalAggregation(nn.Module):
 
         self.reduction = reduction.lower()
         self.pool = get_reduction_fn(self.reduction)
-        self.rbf_dist = GaussianRBF(start=0.0, stop=1.0, num_kernels=self.num_rbf)
 
     def forward(self, pxb):
         p, x, b = pxb
         Total_N = p.shape[0]
 
-        row, col = adaptive_knn(
-            x=p, y=p,
-            k=self.nsample,
-            batch_x=b, batch_y=b
-        )
+        # 1. Quét lân cận
+        row, col = pyg_radius(p, p, self.radius, b, b, max_num_neighbors=self.nsample)
 
+        # 2. Vector tọa độ tương đối dp [E, 3]
         diff = p[col] - p[row]
-        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)
+        dp = diff / self.radius if self.normalize_dp else diff
 
-        max_dist_per_node = scatter(
-            dist, row, dim=0, dim_size=Total_N, reduce='max'
-        )
-        dynamic_radius = max_dist_per_node[row] + 1e-6
+        # 3. GIAI ĐOẠN 2: Tính khoảng cách Euclidean d_ij và chiếu qua Gaussian RBF
+        # Thêm 1e-8 để chống lỗi đạo hàm khi 2 điểm trùng nhau (d = 0)
+        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)  # [E, 1]
+        dist_rbf = self.rbf_dist(dist)                                        # [E, 16]
 
-        dist_normalized = dist / dynamic_radius
-        dp = diff / dynamic_radius if self.normalize_dp else diff
-
-        dist_rbf = self.rbf_dist(dist_normalized)
-
+        # 4. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
         xj = x[col]
-        edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)
+        edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)                 # [E, 16 + 3 + C]
 
+        # 5. MLP và gom tụ về điểm tâm
         edge_features = self.convs(edge_features)
         x_aggr = self.pool(edge_features, row, dim_size=Total_N)
 
@@ -239,7 +215,6 @@ class SetAbstraction(nn.Module):
         self.all_aggr = not is_head and stride == 1
         self.use_res = use_res and not self.all_aggr and not self.is_head
         self.num_rbf = num_rbf if not is_head else 0
-        self.rbf_dist = GaussianRBF(start=0.0, stop=1.0, num_kernels=self.num_rbf)
         conv_args = conv_args if conv_args is not None else {}
 
         # 1. Kênh cạnh: Nếu không phải is_head, có thêm 16 chiều RBF + 3 chiều dp
@@ -290,6 +265,7 @@ class SetAbstraction(nn.Module):
             x = self.convs(x)
             return p, x, b
 
+        # 1. Hạ mẫu bằng FPS theo tỷ lệ %
         if not self.all_aggr:
             idx = self.sample_fn(p, b, ratio=(1.0 / self.stride))
             new_p = p[idx]
@@ -300,34 +276,26 @@ class SetAbstraction(nn.Module):
             new_b = b
 
         if self.use_res:
-            identity = self.skipconv(x[idx]) if idx is not None else self.skipconv(x)
+            identity = self.skipconv(x[idx])
 
-        row, col = adaptive_knn(
-            x=p, y=new_p,
-            k=self.nsample,
-            batch_x=b, batch_y=new_b
-        )
+        # 2. Quét lân cận hai tập điểm
+        row, col = pyg_radius(p, new_p, self.radius, b, new_b, max_num_neighbors=self.nsample)
 
+        # 3. Vector tọa độ tương đối dp [E, 3]
         diff = p[col] - new_p[row]
-        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)
+        dp = diff / self.radius if self.normalize_dp else diff
 
-        max_dist_per_node = scatter(
-            dist, row, dim=0, dim_size=new_p.size(0), reduce='max'
-        )
-        dynamic_radius = max_dist_per_node[row] + 1e-6
+        # 4. GIAI ĐOẠN 2: Tính khoảng cách Euclidean d_ij và chiếu qua Gaussian RBF
+        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)  # [E, 1]
+        dist_rbf = self.rbf_dist(dist)                                        # [E, 16]
 
-        dist_normalized = dist / dynamic_radius
-        dp = diff / dynamic_radius if self.normalize_dp else diff
-
-        dist_rbf = self.rbf_dist(dist_normalized)
-
+        # 5. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
         xj = x[col]
         edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)
 
+        # 6. MLP và Max-pooling về các điểm tâm mới
         edge_features = self.convs(edge_features)
-        new_x = scatter(
-            edge_features, row, dim=0, dim_size=new_p.size(0), reduce='max'
-        )
+        new_x = scatter(edge_features, row, dim=0, dim_size=new_p.size(0), reduce='max')
 
         if self.use_res:
             new_x = self.act(new_x + identity)
