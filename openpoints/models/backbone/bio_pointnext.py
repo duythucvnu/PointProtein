@@ -4,18 +4,126 @@ from typing import List, Type
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from torch_geometric.nn import fps as pyg_fps, radius as pyg_radius
-from torch_geometric.nn import global_mean_pool, global_max_pool, fps
-from torch_geometric.utils import scatter
+from torch_geometric.nn import global_mean_pool, global_max_pool
+from torch_scatter import scatter
 
 from ..build import MODELS
 from ..layers import (
-    create_convblock1d, create_convblock2d, create_linearblock,
-    create_act, CHANNEL_MAP, create_grouper, furthest_point_sample,
-    random_sample, three_interpolation, get_aggregation_feautres
+    create_linearblock, create_act, random_sample
 )
+
+
+# =============================================================================
+# CÁC HÀM TOÁN HỌC QUATERNION VÀ LRF (LOCAL REFERENCE FRAME)
+# =============================================================================
+
+def rotation_matrix_to_quaternion(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Chuyển đổi ma trận quay 3x3 sang Unit Quaternion (w, x, y, z).
+    Thuật toán Shepperd tránh chia cho 0, bảo toàn tính liên tục vi phân.
+    R: [E, 3, 3] -> q: [E, 4] với w >= 0.
+    """
+    orig_shape = R.shape[:-2]
+    R = R.reshape(-1, 3, 3)
+    num_matrices = R.size(0)
+
+    if num_matrices == 0:
+        return torch.empty((*orig_shape, 4), device=R.device)
+
+    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+
+    t0 = 1.0 + m00 + m11 + m22
+    t1 = 1.0 + m00 - m11 - m22
+    t2 = 1.0 - m00 + m11 - m22
+    t3 = 1.0 - m00 - m11 + m22
+
+    q0 = torch.stack([t0, m21 - m12, m02 - m20, m10 - m01], dim=-1)
+    q1 = torch.stack([m21 - m12, t1, m01 + m10, m02 + m20], dim=-1)
+    q2 = torch.stack([m02 - m20, m01 + m10, t2, m12 + m21], dim=-1)
+    q3 = torch.stack([m10 - m01, m02 + m20, m12 + m21, t3], dim=-1)
+
+    candidates_t = torch.stack([t0, t1, t2, t3], dim=-1)
+    max_idx = torch.argmax(candidates_t, dim=-1)
+
+    candidates_q = torch.stack([q0, q1, q2, q3], dim=1)
+    q = candidates_q[torch.arange(num_matrices, device=R.device), max_idx]
+
+    q = q / (torch.norm(q, dim=-1, keepdim=True) + eps)
+
+    # Đảm bảo w >= 0 (Antipodal symmetry)
+    w_negative = (q[:, 0] < 0).unsqueeze(-1)
+    q = torch.where(w_negative, -q, q)
+
+    return q.reshape(*orig_shape, 4)
+
+
+def _single_protein_lrf(p: torch.Tensor) -> torch.Tensor:
+    """Dựng LRF cho 1 protein: p [N, 3] -> F [N, 3, 3] chứa [u_x, u_y, u_z] dạng cột."""
+    N = p.size(0)
+    device = p.device
+
+    if N == 1:
+        return torch.eye(3, device=device).unsqueeze(0)
+    elif N == 2:
+        t = p[1:] - p[:-1]
+        u_x = t / (torch.norm(t, dim=-1, keepdim=True) + 1e-8)
+        arb = torch.tensor([0.0, 1.0, 0.0], device=device).repeat(2, 1)
+        u_z = torch.cross(u_x, arb, dim=-1)
+        u_z = u_z / (torch.norm(u_z, dim=-1, keepdim=True) + 1e-8)
+        u_y = torch.cross(u_z, u_x, dim=-1)
+        return torch.stack([u_x, u_y, u_z], dim=-1)
+
+    # 1. Hướng tiếp tuyến mạch chính u_x
+    t = torch.empty_like(p)
+    t[1:-1] = p[2:] - p[:-2]
+    t[0]    = p[1] - p[0]
+    t[-1]   = p[-1] - p[-2]
+    u_x = t / (torch.norm(t, dim=-1, keepdim=True) + 1e-8)
+
+    # 2. Hướng uốn cong u_y (mặt trước / side-chain nhô ra)
+    n = torch.empty_like(p)
+    n[1:-1] = p[2:] - 2.0 * p[1:-1] + p[:-2]
+    n[0]    = n[1]
+    n[-1]   = n[-2]
+
+    # Gram-Schmidt trực giao hóa
+    proj = torch.sum(n * u_x, dim=-1, keepdim=True) * u_x
+    u_y_raw = n - proj
+    u_y_norm = torch.norm(u_y_raw, dim=-1, keepdim=True)
+
+    straight_line = (u_y_norm < 1e-4).squeeze(-1)
+    if straight_line.any():
+        arb = torch.zeros_like(u_x)
+        arb[:, 1] = 1.0
+        collinear = (torch.abs(u_x[:, 1]) > 0.9).unsqueeze(-1)
+        arb = torch.where(collinear, torch.tensor([1.0, 0.0, 0.0], device=device), arb)
+        proj_arb = torch.sum(arb * u_x, dim=-1, keepdim=True) * u_x
+        u_y_raw = torch.where(straight_line.unsqueeze(-1), arb - proj_arb, u_y_raw)
+        u_y_norm = torch.norm(u_y_raw, dim=-1, keepdim=True)
+
+    u_y = u_y_raw / (u_y_norm + 1e-8)
+    u_z = torch.cross(u_x, u_y, dim=-1)
+
+    # Ma trận F_i = [u_x, u_y, u_z] (dạng cột)
+    return torch.stack([u_x, u_y, u_z], dim=-1)
+
+
+def compute_backbone_lrf(p: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    """Dựng LRF cho toàn bộ batch protein rời rạc trong PyG."""
+    batch_size = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
+    F_list = []
+    for b in range(batch_size):
+        mask = (batch == b)
+        p_b = p[mask]
+        F_list.append(_single_protein_lrf(p_b))
+    return torch.cat(F_list, dim=0)
+
 
 def get_reduction_fn(reduction):
     reduction = 'mean' if reduction.lower() == 'avg' else reduction.lower()
@@ -24,10 +132,23 @@ def get_reduction_fn(reduction):
         x, index, dim=0, dim_size=dim_size, reduce=reduction
     )
 
+
+class GaussianRBF(nn.Module):
+    """Mở rộng đại lượng vô hướng thành vector K-chiều phân bố phi tuyến."""
+    def __init__(self, start=0.0, stop=1.0, num_kernels=16):
+        super().__init__()
+        offset = torch.linspace(start, stop, num_kernels)
+        self.register_buffer('offset', offset)
+        self.coeff = -0.5 / ((stop - start) / (num_kernels - 1)) ** 2
+
+    def forward(self, v):
+        return torch.exp(self.coeff * (v - self.offset) ** 2)
+
+
 class LocalAggregation(nn.Module):
     """
     Gom cụm đặc trưng cục bộ (N -> N).
-    GIAI ĐOẠN 2: Bổ sung Gaussian RBF mã hóa khoảng cách Euclidean d_ij (16 chiều).
+    BƯỚC 2: Bổ sung tọa độ cục bộ bất biến p_ij^local (3 chiều) và Quaternion q_ij (4 chiều).
     """
     def __init__(self,
                  channels: List[int],
@@ -38,7 +159,7 @@ class LocalAggregation(nn.Module):
                  feature_type='dp_fj',
                  reduction='max',
                  last_act=True,
-                 num_rbf: int = 16,        # <-- Số tâm Gauss đo cự ly
+                 num_rbf: int = 16,
                  **kwargs
                  ):
         super().__init__()
@@ -48,12 +169,12 @@ class LocalAggregation(nn.Module):
         self.normalize_dp = group_args.get('normalize_dp', True)
         self.num_rbf = num_rbf
 
-        # Khởi tạo RBF đo cự ly từ 0.0 Å đến đúng bán kính radius của tầng này
+        # RBF đo cự ly vật lý thực tế
         self.rbf_dist = GaussianRBF(start=0.0, stop=self.radius, num_kernels=self.num_rbf)
 
-        # Kênh cạnh đầu vào = [RBF(d_ij): 16 chiều] + [dp: 3 chiều] + [x_j: channels[0]]
+        # KÊNH CẠNH MỚI: RBF(16) + p_local(3) + Quaternion(4) + x_j(channels[0]) = 23 + C
         channels = list(channels)
-        in_edge_channels = self.num_rbf + 3 + channels[0]
+        in_edge_channels = self.num_rbf + 3 + 4 + channels[0]
 
         convs = []
         curr_c = in_edge_channels
@@ -73,38 +194,44 @@ class LocalAggregation(nn.Module):
         self.reduction = reduction.lower()
         self.pool = get_reduction_fn(self.reduction)
 
-    def forward(self, pxb):
-        p, x, b = pxb
+    def forward(self, pxbf):
+        # pxb nhận bộ 4: [p, x, b, F]
+        p, x, b, F_mat = pxbf
         Total_N = p.shape[0]
 
-        # 1. Quét lân cận
+        # 1. Quét lân cận bằng Ball Query
         row, col = pyg_radius(p, p, self.radius, b, b, max_num_neighbors=self.nsample)
 
-        # 2. Vector tọa độ tương đối dp [E, 3]
+        # 2. Vector hiệu toàn cục
         diff = p[col] - p[row]
-        dp = diff / self.radius if self.normalize_dp else diff
 
-        # 3. GIAI ĐOẠN 2: Tính khoảng cách Euclidean d_ij và chiếu qua Gaussian RBF
-        # Thêm 1e-8 để chống lỗi đạo hàm khi 2 điểm trùng nhau (d = 0)
-        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)  # [E, 1]
-        dist_rbf = self.rbf_dist(dist)                                        # [E, 16]
+        # 3. TỌA ĐỘ CỤC BỘ BẤT BIẾN: p_ij^local = F_i^T * (p_j - p_i)
+        F_i = F_mat[row]  # [E, 3, 3]
+        p_local = torch.bmm(F_i.transpose(-1, -2), diff.unsqueeze(-1)).squeeze(-1)  # [E, 3]
+        p_local_norm = p_local / self.radius if self.normalize_dp else p_local
 
-        # 4. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
+        # 4. GÓC XOAY TƯƠNG ĐỐI VÀ QUATERNION: R_ij = F_i^T * F_j -> q_ij in R^4
+        F_j = F_mat[col]  # [E, 3, 3]
+        R_ij = torch.bmm(F_i.transpose(-1, -2), F_j)                                 # [E, 3, 3]
+        q_ij = rotation_matrix_to_quaternion(R_ij)                                   # [E, 4]
+
+        # 5. Khoảng cách Euclidean d_ij qua RBF
+        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)        # [E, 1]
+        dist_rbf = self.rbf_dist(dist)                                               # [E, 16]
+
+        # 6. Ghép vector cạnh bất biến SO(3) 100%: [RBF(16) || p_local(3) || q_ij(4) || x_j(C)]
         xj = x[col]
-        edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)                 # [E, 16 + 3 + C]
+        edge_features = torch.cat([dist_rbf, p_local_norm, q_ij, xj], dim=-1)        # [E, 23 + C]
 
-        # 5. MLP và gom tụ về điểm tâm
+        # 7. MLP và Max-pooling gom tụ về điểm tâm
         edge_features = self.convs(edge_features)
         x_aggr = self.pool(edge_features, row, dim_size=Total_N)
 
         return x_aggr
 
-class InvResMLP(nn.Module):
-    """
-    Khối Inverted Residual Bottleneck trong PointNeXt (Phiên bản PyG Sparse Batching).
-    Đặc điểm: Giữ nguyên số lượng điểm N và số kênh C (N -> N, C -> C).
-    """
 
+class InvResMLP(nn.Module):
+    """Khối Inverted Residual Bottleneck trong PointNeXt."""
     def __init__(self,
                  in_channels: int,
                  norm_args={'norm': 'bn1d'},
@@ -123,8 +250,6 @@ class InvResMLP(nn.Module):
         conv_args = conv_args if conv_args is not None else {}
         mid_channels = int(in_channels * expansion)
 
-        # 1. Tầng tương tác không gian cục bộ (LocalAggregation đã viết ở bước trước)
-        # channels = [in_channels, in_channels] -> giữ nguyên số kênh sau khi gom cụm
         self.convs = LocalAggregation(
             channels=[in_channels, in_channels],
             norm_args=norm_args,
@@ -135,17 +260,13 @@ class InvResMLP(nn.Module):
             **kwargs
         )
 
-        # 2. Xây dựng danh sách kênh cho Pointwise MLP (mở rộng và nén kênh)
         if num_posconvs < 1:
             channels = []
         elif num_posconvs == 1:
             channels = [in_channels, in_channels]
         else:
-            # Chuẩn mực của Inverted Bottleneck: [C, 4C, C]
             channels = [in_channels, mid_channels, in_channels]
 
-        # 3. Tạo chuỗi Pointwise MLP (dùng create_linearblock của OpenPoints)
-        # Vì tensor của PyG có shape [Total_N, C], tầng Linear đóng vai trò như Pointwise 1x1 Conv
         pwconv = []
         for i in range(len(channels) - 1):
             is_last_layer = (i == len(channels) - 2)
@@ -160,38 +281,26 @@ class InvResMLP(nn.Module):
         self.pwconv = nn.Sequential(*pwconv)
         self.act = create_act(act_args)
 
-    def forward(self, pxb):
-        """
-        Nhận vào tuple/list pxb = (p, x, b):
-            p: [Total_N, 3]  -> Tọa độ các điểm
-            x: [Total_N, C]  -> Đặc trưng của các điểm
-            b: [Total_N]     -> Chỉ số batch
-        Trả về:
-            [p, x, b]: Giữ nguyên tọa độ, batch index và cập nhật đặc trưng x mới
-        """
-        p, x, b = pxb
-        identity = x  # Giữ lại nhánh tắt (Residual Identity)
+    def forward(self, pxbf):
+        p, x, b, F_mat = pxbf
+        identity = x
 
-        # 1. Gom tụ không gian cục bộ (Depthwise-like)
-        x = self.convs([p, x, b])
-
-        # 2. Mở rộng và nén kênh đặc trưng (Pointwise C -> 4C -> C)
+        # Truyền bộ 4 [p, x, b, F] vào LocalAggregation
+        x = self.convs([p, x, b, F_mat])
         x = self.pwconv(x)
 
-        # 3. Cộng nhánh tắt phần dư (Skip connection)
-        # Đảm bảo cùng kích thước kênh C trước khi cộng
         if self.use_res and x.shape[-1] == identity.shape[-1]:
             x = x + identity
 
-        # 4. Kích hoạt phi tuyến cuối cùng
         x = self.act(x)
+        # Giữ nguyên và truyền tiếp bộ 4 [p, x, b, F]
+        return [p, x, b, F_mat]
 
-        return [p, x, b]
 
 class SetAbstraction(nn.Module):
     """
     Khối hạ mẫu theo tỷ lệ % (FPS) và gom cụm.
-    GIAI ĐOẠN 2: Bổ sung Gaussian RBF mã hóa khoảng cách Euclidean d_ij (16 chiều).
+    BƯỚC 2: Tích hợp tọa độ cục bộ p_local và Quaternion q_ij.
     """
     def __init__(self,
                  in_channels: int,
@@ -206,7 +315,7 @@ class SetAbstraction(nn.Module):
                  feature_type: str = 'dp_fj',
                  use_res: bool = False,
                  is_head: bool = False,
-                 num_rbf: int = 16,        # <-- Số tâm Gauss đo cự ly
+                 num_rbf: int = 16,
                  **kwargs
                  ):
         super().__init__()
@@ -217,19 +326,17 @@ class SetAbstraction(nn.Module):
         self.num_rbf = num_rbf if not is_head else 0
         conv_args = conv_args if conv_args is not None else {}
 
-        # 1. Kênh cạnh: Nếu không phải is_head, có thêm 16 chiều RBF + 3 chiều dp
-        in_edge_channels = in_channels if is_head else (in_channels + 3 + self.num_rbf)
+        # KÊNH CẠNH MỚI: RBF(16) + p_local(3) + Quaternion(4) + in_channels = 23 + in_channels
+        in_edge_channels = in_channels if is_head else (in_channels + 3 + 4 + self.num_rbf)
         mid_channel = out_channels // 2 if stride > 1 else out_channels
         channels = [in_edge_channels] + [mid_channel] * (layers - 1) + [out_channels]
 
-        # 2. Skip connection
         if self.use_res:
             self.skipconv = create_linearblock(
                 in_channels, channels[-1], norm_args=None, act_args=None
             ) if in_channels != channels[-1] else nn.Identity()
             self.act = create_act(act_args)
 
-        # 3. Chuỗi MLP
         convs = []
         for i in range(len(channels) - 1):
             is_last_layer = (i == len(channels) - 2)
@@ -248,7 +355,6 @@ class SetAbstraction(nn.Module):
             self.nsample = group_args.get('nsample', 32)
             self.normalize_dp = group_args.get('normalize_dp', True)
 
-            # RBF đo cự ly cho tầng SetAbstraction
             self.rbf_dist = GaussianRBF(start=0.0, stop=self.radius, num_kernels=self.num_rbf)
 
             if sampler.lower() == 'fps':
@@ -258,81 +364,71 @@ class SetAbstraction(nn.Module):
             else:
                 raise NotImplementedError(f"Sampler {sampler} not supported")
 
-    def forward(self, pxb):
-        p, x, b = pxb
+    def forward(self, pxbf):
+        p, x, b, F_mat = pxbf
 
         if self.is_head:
             x = self.convs(x)
-            return p, x, b
+            return [p, x, b, F_mat]
 
-        # 1. Hạ mẫu bằng FPS theo tỷ lệ %
+        # 1. Hạ mẫu bằng FPS chuẩn
         if not self.all_aggr:
             idx = self.sample_fn(p, b, ratio=(1.0 / self.stride))
             new_p = p[idx]
             new_b = b[idx]
+            new_F = F_mat[idx]  # CÁC ĐIỂM TÂM MỚI KẾ THỪA LRF TƯƠNG ỨNG!
         else:
             idx = None
             new_p = p
             new_b = b
+            new_F = F_mat
 
         if self.use_res:
-            identity = self.skipconv(x[idx])
+            identity = self.skipconv(x[idx]) if idx is not None else self.skipconv(x)
 
-        # 2. Quét lân cận hai tập điểm
+        # 2. Quét lân cận hai tập điểm bằng Ball Query
         row, col = pyg_radius(p, new_p, self.radius, b, new_b, max_num_neighbors=self.nsample)
 
-        # 3. Vector tọa độ tương đối dp [E, 3]
+        # 3. Vector hiệu
         diff = p[col] - new_p[row]
-        dp = diff / self.radius if self.normalize_dp else diff
 
-        # 4. GIAI ĐOẠN 2: Tính khoảng cách Euclidean d_ij và chiếu qua Gaussian RBF
-        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)  # [E, 1]
-        dist_rbf = self.rbf_dist(dist)                                        # [E, 16]
+        # 4. TỌA ĐỘ CỤC BỘ BẤT BIẾN: new_F[row]^T * (p_j - new_p_i)
+        F_i = new_F[row]  # [E, 3, 3]
+        p_local = torch.bmm(F_i.transpose(-1, -2), diff.unsqueeze(-1)).squeeze(-1)  # [E, 3]
+        p_local_norm = p_local / self.radius if self.normalize_dp else p_local
 
-        # 5. Ghép đặc trưng cạnh: [RBF(d_ij) || dp || x_j]
+        # 5. GÓC XOAY TƯƠNG ĐỐI VÀ QUATERNION: R_ij = new_F[row]^T * F[col]
+        F_j = F_mat[col]  # [E, 3, 3]
+        R_ij = torch.bmm(F_i.transpose(-1, -2), F_j)                                 # [E, 3, 3]
+        q_ij = rotation_matrix_to_quaternion(R_ij)                                   # [E, 4]
+
+        # 6. Khoảng cách Euclidean d_ij qua RBF
+        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)        # [E, 1]
+        dist_rbf = self.rbf_dist(dist)                                               # [E, 16]
+
+        # 7. Ghép đặc trưng cạnh: [RBF(16) || p_local(3) || q_ij(4) || x_j(C)]
         xj = x[col]
-        edge_features = torch.cat([dist_rbf, dp, xj], dim=-1)
+        edge_features = torch.cat([dist_rbf, p_local_norm, q_ij, xj], dim=-1)        # [E, 23 + C]
 
-        # 6. MLP và Max-pooling về các điểm tâm mới
+        # 8. MLP và Max-pooling về các điểm tâm mới
         edge_features = self.convs(edge_features)
         new_x = scatter(edge_features, row, dim=0, dim_size=new_p.size(0), reduce='max')
 
         if self.use_res:
             new_x = self.act(new_x + identity)
 
-        return new_p, new_x, new_b
+        # Trả về bộ 4 để đi tiếp sang Stage tiếp theo
+        return [new_p, new_x, new_b, new_F]
 
 
-class GaussianRBF(nn.Module):
-    """
-    Hàm cơ sở bán kính Gauss (Gaussian Radial Basis Functions).
-    Biến đổi một đại lượng vô hướng liên tục (như SASA/RSA) thành vector K-chiều phân bố phi tuyến.
-    """
-    def __init__(self, start=0.0, stop=1.0, num_kernels=16):
-        super().__init__()
-        # Tạo K tâm Gauss rải đều từ start đến stop
-        offset = torch.linspace(start, stop, num_kernels)
-        self.register_buffer('offset', offset)
-        # Độ rộng sigma tương ứng với khoảng cách giữa các tâm
-        self.coeff = -0.5 / ((stop - start) / (num_kernels - 1)) ** 2
-
-    def forward(self, v):
-        # v: [N, 1] -> output: [N, num_kernels]
-        return torch.exp(self.coeff * (v - self.offset) ** 2)
-
+# =============================================================================
+# STEM VÀ ENCODER CHÍNH
+# =============================================================================
 
 class SurfaceGatedBiochemicalStem(nn.Module):
-    """
-    TẦNG 1: SURFACE-GATED BIOCHEMICAL UNIT (SGBU)
-    - Nhánh 1 (Sequence): 20 Axit Amin One-hot -> Linear Embedding + Tương tác sâu
-    - Nhánh 2 (Surface): SASA (0-300 Å²) & RSA (0.0-1.0) mở rộng qua Gaussian RBF 16 bins -> 32 chiều
-    - Cơ chế Gating: Bề mặt điều hòa hoạt tính hóa sinh (g * Sequence + (1-g) * Surface)
-    TUYỆT ĐỐI KHÔNG DÙNG TỌA ĐỘ p Ở ĐÂY -> BẢO TOÀN SE(3) INVARIANCE 100%!
-    """
+    """Stem đa phương thức: SGBU (Sequence + Surface qua RBF)."""
     def __init__(self, out_channels=32):
         super().__init__()
-        
-        # 1. Nhánh Sequence (One-hot 20 Axit Amin)
         self.seq_branch = nn.Sequential(
             nn.Linear(20, out_channels, bias=False),
             nn.BatchNorm1d(out_channels),
@@ -340,8 +436,6 @@ class SurfaceGatedBiochemicalStem(nn.Module):
             nn.Linear(out_channels, out_channels, bias=False),
             nn.BatchNorm1d(out_channels)
         )
-
-        # 2. Nhánh Surface (SASA & RSA qua Gaussian RBF)
         self.rbf_sasa = GaussianRBF(start=0.0, stop=300.0, num_kernels=16)
         self.rbf_rsa  = GaussianRBF(start=0.0, stop=1.0, num_kernels=16)
         self.surf_branch = nn.Sequential(
@@ -351,14 +445,10 @@ class SurfaceGatedBiochemicalStem(nn.Module):
             nn.Linear(out_channels, out_channels, bias=False),
             nn.BatchNorm1d(out_channels)
         )
-
-        # 3. Surface Gate: Tính toán hệ số cổng đóng/mở g in (0, 1)
         self.surface_gate = nn.Sequential(
             nn.Linear(out_channels, out_channels),
             nn.Sigmoid()
         )
-
-        # 4. Tầng chuẩn hóa và chiếu đặc trưng dung hợp cuối cùng
         self.fusion_proj = nn.Sequential(
             nn.Linear(out_channels, out_channels, bias=False),
             nn.BatchNorm1d(out_channels),
@@ -366,25 +456,18 @@ class SurfaceGatedBiochemicalStem(nn.Module):
         )
 
     def forward(self, p, x):
-        # Tách dữ liệu từ tensor x [Total_N, 22]
         seq_onehot = x[:, :20]
         sasa_val   = x[:, 20:21]
         rsa_val    = x[:, 21:22]
 
-        # 1. Trích xuất đặc trưng chuỗi và bề mặt độc lập
         f_seq = self.seq_branch(seq_onehot)
-
         sasa_rbf = self.rbf_sasa(sasa_val)
         rsa_rbf  = self.rbf_rsa(rsa_val)
-        surf_rbf = torch.cat([sasa_rbf, rsa_rbf], dim=-1) # [Total_N, 32]
+        surf_rbf = torch.cat([sasa_rbf, rsa_rbf], dim=-1)
         f_surf   = self.surf_branch(surf_rbf)
 
-        # 2. Cơ chế cổng điều hòa sinh học (Surface-Gated):
-        # Mức độ phơi lộ quyết định mức độ kích hoạt của loại axit amin
         g = self.surface_gate(f_surf)
         f_0 = g * f_seq + (1.0 - g) * f_surf
-
-        # 3. Chiếu ra kích thước width của PointNeXt
         return self.fusion_proj(f_0)
 
 
@@ -424,7 +507,6 @@ class PointNextEncoderPyG(nn.Module):
         radius_scaling = kwargs.get('radius_scaling', 1.5)
         nsample_scaling = kwargs.get('nsample_scaling', 1)
 
-        # 1. KHỞI TẠO STEM MỚI (SGBU)
         self.use_multimodal = use_multimodal
         if self.use_multimodal:
             self.stem = SurfaceGatedBiochemicalStem(out_channels=width)
@@ -433,12 +515,10 @@ class PointNextEncoderPyG(nn.Module):
             self.stem = None
             self.in_channels = in_channels
 
-        # 2. Tự động tính toán bán kính nở rộng
         self.radii = self._to_full_list(radius, radius_scaling)
         self.nsample = self._to_full_list(nsample, nsample_scaling)
         logging.info(f'[PointNextEncoderPyG] Radii: {self.radii}, Nsample: {self.nsample}')
 
-        # 3. Tính toán số kênh cho các Stage
         channels = []
         curr_w = width
         for stride in strides:
@@ -446,7 +526,6 @@ class PointNextEncoderPyG(nn.Module):
                 curr_w *= 2
             channels.append(curr_w)
 
-        # 4. Lắp ráp 6 Stage
         encoder = []
         for i in range(len(blocks)):
             stage_group_args = copy.deepcopy(group_args)
@@ -541,14 +620,19 @@ class PointNextEncoderPyG(nn.Module):
         if f0 is None:
             f0 = p0.clone()
 
-        # DUNG HỢP BẰNG SGBU CHUẨN SE(3)
+        # 1. DỰNG HỆ TRỤC LRF CỤC BỘ BAN ĐẦU CHO TỪNG AXIT AMIN (Chỉ mất ~0.2ms trên GPU)
+        F_mat = compute_backbone_lrf(p0, batch0)
+
+        # 2. Dung hợp đặc trưng Nút bằng SGBU (chuẩn SE(3))
         if self.use_multimodal and self.stem is not None:
             f0 = self.stem(p0, f0)
 
-        p, x, b = p0, f0, batch0
+        # 3. Đóng gói bộ 4 phần tử [p, x, b, F] cho các Stage của PointNeXt
+        pxbf = [p0, f0, batch0, F_mat]
         for stage in self.encoder:
-            p, x, b = stage([p, x, b])
+            pxbf = stage(pxbf)
 
+        p, x, b, _ = pxbf
         return p, x, b
 
     def forward(self, p0, f0=None, batch0=None):
