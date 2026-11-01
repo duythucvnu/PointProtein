@@ -15,7 +15,7 @@ model:
     strides: [1, 2, 2, 2, 2, 1]
     width: 32
     in_channels: 3 
-    radius: 6
+    radius: 8
     radius_scaling: 1.5
     sa_layers: 2
     sa_use_res: True
